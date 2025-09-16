@@ -31,7 +31,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, LimboError, OpenFlags, QueryMode, Statement, StepResult, Value,
+    Connection, Database, LimboError, OpenFlags, QueryMode, Statement, StatementMetrics,
+    StepResult, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -466,7 +467,8 @@ impl Limbo {
             }
         }
 
-        self.print_query_performance_stats(start, stats.as_ref());
+        let last_statement_metrics = self.conn.metrics.borrow().last_statement.clone();
+        self.print_query_performance_stats(start, stats.as_ref(), last_statement_metrics.as_ref());
 
         // Display stats if enabled
         if self.opts.stats {
@@ -483,7 +485,13 @@ impl Limbo {
         }
     }
 
-    fn print_query_performance_stats(&mut self, start: Instant, stats: Option<&QueryStatistics>) {
+    fn print_query_performance_stats(
+        &mut self,
+        start: Instant,
+        stats: Option<&QueryStatistics>,
+        metrics: Option<&StatementMetrics>,
+    ) {
+        let total_duration = start.elapsed();
         let elapsed_as_str = |duration: Duration| {
             if duration.as_secs() >= 1 {
                 format!("{} s", duration.as_secs_f64())
@@ -493,6 +501,22 @@ impl Limbo {
                 format!("{} us", duration.as_micros() as f64)
             } else {
                 format!("{} ns", duration.as_nanos())
+            }
+        };
+        let bytes_as_str = |bytes: u64| {
+            const KB: f64 = 1024.0;
+            const MB: f64 = KB * 1024.0;
+            const GB: f64 = MB * 1024.0;
+            if bytes == 0 {
+                "0 B".to_string()
+            } else if (bytes as f64) >= GB {
+                format!("{:.2} GB", bytes as f64 / GB)
+            } else if (bytes as f64) >= MB {
+                format!("{:.2} MB", bytes as f64 / MB)
+            } else if (bytes as f64) >= KB {
+                format!("{:.2} KB", bytes as f64 / KB)
+            } else {
+                format!("{bytes} B")
             }
         };
         let sample_stats_as_str = |name: &str, samples: &Vec<Duration>| {
@@ -513,7 +537,7 @@ impl Limbo {
                 let _ = self.writeln("Command stats:\n----------------------------");
                 let _ = self.writeln(format!(
                     "total: {} (this includes parsing/coloring of cli app)\n",
-                    elapsed_as_str(start.elapsed())
+                    elapsed_as_str(total_duration)
                 ));
 
                 let _ = self.writeln("query execution stats:\n----------------------------");
@@ -522,6 +546,37 @@ impl Limbo {
                     &stats.execute_time_elapsed_samples,
                 ));
                 let _ = self.writeln(sample_stats_as_str("I/O", &stats.io_time_elapsed_samples));
+                if let Some(metrics) = metrics {
+                    let _ = self.writeln("query cost metrics:\n----------------------------");
+                    let rows_total = metrics.total_row_ops();
+                    let _ = self.writeln(format!(
+                        "rows processed: {} read / {} written (total {})",
+                        metrics.rows_read, metrics.rows_written, rows_total
+                    ));
+                    let total_bytes = metrics.io_bytes_read + metrics.io_bytes_written;
+                    let throughput = if total_duration.as_secs_f64() > 0.0 {
+                        total_bytes as f64 / total_duration.as_secs_f64() / (1024.0 * 1024.0)
+                    } else {
+                        0.0
+                    };
+                    let _ = self.writeln(format!(
+                        "I/O: {} read, {} written (throughput {:.2} MB/s)",
+                        bytes_as_str(metrics.io_bytes_read),
+                        bytes_as_str(metrics.io_bytes_written),
+                        throughput
+                    ));
+                    if metrics.indexes_used.is_empty() {
+                        let _ = self.writeln("Indexes used: none");
+                    } else {
+                        let indexes = metrics
+                            .indexes_used
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = self.writeln(format!("Indexes used: {indexes}"));
+                    }
+                }
             }
         }
     }

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{cell::Cell, fmt, rc::Rc, sync::Arc};
 
 use super::buffer_pool::BufferPool;
-use super::pager::{PageRef, Pager};
+use super::pager::{IoCounters, PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
 use crate::io::{clock, File, IO};
@@ -561,6 +561,7 @@ impl fmt::Debug for OngoingCheckpoint {
 pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
+    io_counters: Rc<IoCounters>,
 
     syncing: Rc<Cell<bool>>,
 
@@ -1083,6 +1084,7 @@ impl Wal for WalFile {
         let frame = page.clone();
         let page_idx = page.get().id;
         let shared_file = self.shared.clone();
+        let io_counters = self.io_counters.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
                 page.clear_locked();
@@ -1094,6 +1096,7 @@ impl Wal for WalFile {
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
+            io_counters.increment_read(bytes_read as u64);
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
@@ -1125,6 +1128,7 @@ impl Wal for WalFile {
             complete,
             page_idx,
             &self.io_ctx.borrow(),
+            self.io_counters.clone(),
         )
     }
 
@@ -1182,7 +1186,13 @@ impl Wal for WalFile {
             "WAL must be enabled"
         );
         let file = shared.file.as_ref().unwrap();
-        let c = begin_read_wal_frame_raw(&self.buffer_pool, file, offset, complete)?;
+        let c = begin_read_wal_frame_raw(
+            &self.buffer_pool,
+            file,
+            offset,
+            complete,
+            self.io_counters.clone(),
+        )?;
         Ok(c)
     }
 
@@ -1250,6 +1260,7 @@ impl Wal for WalFile {
                 complete,
                 page_id as usize,
                 &self.io_ctx.borrow(),
+                self.io_counters.clone(),
             )?;
             self.io.wait_for_completion(c)?;
             return if conflict.get() {
@@ -1284,8 +1295,13 @@ impl Wal for WalFile {
             db_size as u32,
             page,
         );
-        let c = Completion::new_write(|_| {});
-        let c = file.pwrite(offset, frame_bytes, c)?;
+        let io_counters = self.io_counters.clone();
+        let completion = Completion::new_write(move |res: Result<i32, CompletionError>| {
+            if let Ok(bytes_written) = res {
+                io_counters.increment_write(bytes_written.max(0) as u64);
+            }
+        });
+        let c = file.pwrite(offset, frame_bytes, completion)?;
         self.io.wait_for_completion(c)?;
         self.complete_append_frame(page_id, frame_id, checksums);
         if db_size > 0 {
@@ -1349,6 +1365,7 @@ impl Wal for WalFile {
                 data_to_write,
             );
 
+            let io_counters = self.io_counters.clone();
             let c = Completion::new_write({
                 let frame_bytes = frame_bytes.clone();
                 move |res: Result<i32, CompletionError>| {
@@ -1360,6 +1377,7 @@ impl Wal for WalFile {
                         bytes_written == frame_len as i32,
                         "wrote({bytes_written}) != expected({frame_len})"
                     );
+                    io_counters.increment_write(bytes_written as u64);
 
                     page.clear_dirty();
                     let seq = shared_file.read().epoch.load(Ordering::Acquire);
@@ -1583,6 +1601,7 @@ impl Wal for WalFile {
         // single completion for the whole batch
         let total_len: i32 = iovecs.iter().map(|b| b.len() as i32).sum();
         let page_frame_for_cb = page_frame_and_checksum.clone();
+        let io_counters = self.io_counters.clone();
         let cmp = move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
@@ -1591,6 +1610,7 @@ impl Wal for WalFile {
                 bytes_written == total_len,
                 "pwritev wrote {bytes_written} bytes, expected {total_len}"
             );
+            io_counters.increment_write(bytes_written.max(0) as u64);
 
             for (page, fid, _csum) in &page_frame_for_cb {
                 page.clear_dirty();
@@ -1634,6 +1654,7 @@ impl WalFile {
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
         buffer_pool: Arc<BufferPool>,
+        io_counters: Rc<IoCounters>,
     ) -> Self {
         let (header, last_checksum, max_frame) = {
             let shared_guard = shared.read();
@@ -1650,6 +1671,7 @@ impl WalFile {
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
             max_frame,
             shared,
+            io_counters,
             ongoing_checkpoint: OngoingCheckpoint {
                 time: now,
                 pending_writes: WriteBatch::new(),
@@ -2251,6 +2273,7 @@ impl WalFile {
             complete,
             page_id,
             &self.io_ctx.borrow(),
+            self.io_counters.clone(),
         )?;
 
         Ok(InflightRead {

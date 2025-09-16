@@ -7666,7 +7666,7 @@ mod tests {
         storage::{
             database::DatabaseFile,
             page_cache::PageCache,
-            pager::{AtomicDbState, DbState},
+            pager::{AtomicDbState, DbState, IoCounters},
             sqlite3_ondisk::PageSize,
         },
         types::Text,
@@ -8909,10 +8909,12 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
+        let io_counters = Rc::new(IoCounters::default());
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
             wal_shared,
             buffer_pool.clone(),
+            io_counters.clone(),
         )));
 
         let pager = Rc::new(
@@ -8924,6 +8926,7 @@ mod tests {
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
+                io_counters,
             )
             .unwrap(),
         );

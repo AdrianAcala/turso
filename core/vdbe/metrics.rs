@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 /// Statement-level execution metrics
@@ -27,6 +28,13 @@ pub struct StatementMetrics {
     pub btree_seeks: u64,
     pub btree_next: u64,
     pub btree_prev: u64,
+
+    // I/O activity
+    pub io_bytes_read: u64,
+    pub io_bytes_written: u64,
+
+    // Index usage information
+    pub indexes_used: BTreeSet<String>,
 }
 
 impl StatementMetrics {
@@ -54,6 +62,9 @@ impl StatementMetrics {
         self.btree_seeks = self.btree_seeks.saturating_add(other.btree_seeks);
         self.btree_next = self.btree_next.saturating_add(other.btree_next);
         self.btree_prev = self.btree_prev.saturating_add(other.btree_prev);
+        self.io_bytes_read = self.io_bytes_read.saturating_add(other.io_bytes_read);
+        self.io_bytes_written = self.io_bytes_written.saturating_add(other.io_bytes_written);
+        self.indexes_used.extend(other.indexes_used.iter().cloned());
     }
 
     /// Reset all counters to zero
@@ -81,6 +92,15 @@ impl fmt::Display for StatementMetrics {
         writeln!(f, "    Seeks:            {}", self.btree_seeks)?;
         writeln!(f, "    Next:             {}", self.btree_next)?;
         writeln!(f, "    Prev:             {}", self.btree_prev)?;
+        writeln!(f, "  I/O:")?;
+        writeln!(f, "    Bytes read:       {}", self.io_bytes_read)?;
+        writeln!(f, "    Bytes written:    {}", self.io_bytes_written)?;
+        if !self.indexes_used.is_empty() {
+            writeln!(f, "  Indexes Used:")?;
+            for index in &self.indexes_used {
+                writeln!(f, "    {index}")?;
+            }
+        }
         Ok(())
     }
 }

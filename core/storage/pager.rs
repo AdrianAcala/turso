@@ -36,6 +36,55 @@ const DEFAULT_MAX_PAGE_COUNT: u32 = 0xfffffffe;
 #[cfg(not(feature = "omit_autovacuum"))]
 use ptrmap::*;
 
+#[derive(Debug, Default)]
+pub struct IoCounters {
+    bytes_read: Cell<u64>,
+    bytes_written: Cell<u64>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IoCounterSnapshot {
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+}
+
+impl IoCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn increment_read(&self, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        let current = self.bytes_read.get();
+        self.bytes_read.set(current.saturating_add(amount));
+    }
+
+    pub fn increment_write(&self, amount: u64) {
+        if amount == 0 {
+            return;
+        }
+        let current = self.bytes_written.get();
+        self.bytes_written.set(current.saturating_add(amount));
+    }
+
+    pub fn snapshot(&self) -> IoCounterSnapshot {
+        IoCounterSnapshot {
+            bytes_read: self.bytes_read.get(),
+            bytes_written: self.bytes_written.get(),
+        }
+    }
+
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.get()
+    }
+
+    pub fn bytes_written(&self) -> u64 {
+        self.bytes_written.get()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
 
@@ -471,6 +520,8 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
+    /// Aggregated I/O counters for the pager.
+    pub(crate) io_counters: Rc<IoCounters>,
     dirty_pages: Rc<RefCell<HashSet<usize, hash::BuildHasherDefault<hash::DefaultHasher>>>>,
 
     commit_info: CommitInfo,
@@ -565,6 +616,7 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
+        io_counters: Rc<IoCounters>,
     ) -> Result<Self> {
         let allocate_page1_state = if !db_state.is_initialized() {
             RefCell::new(AllocatePage1State::Start)
@@ -577,6 +629,7 @@ impl Pager {
             wal,
             page_cache,
             io,
+            io_counters,
             dirty_pages: Rc::new(RefCell::new(HashSet::with_hasher(
                 hash::BuildHasherDefault::new(),
             ))),
@@ -605,6 +658,14 @@ impl Pager {
             btree_create_vacuum_full_state: Cell::new(BtreeCreateVacuumFullState::Start),
             io_ctx: RefCell::new(IOContext::default()),
         })
+    }
+
+    pub fn io_counters(&self) -> Rc<IoCounters> {
+        self.io_counters.clone()
+    }
+
+    pub fn io_counters_snapshot(&self) -> IoCounterSnapshot {
+        self.io_counters.snapshot()
     }
 
     /// Get the maximum page count for this database
@@ -1155,6 +1216,7 @@ impl Pager {
             page_idx,
             allow_empty_read,
             io_ctx,
+            self.io_counters.clone(),
         )
     }
 
@@ -2516,6 +2578,7 @@ mod ptrmap_tests {
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
         let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
+        let io_counters = Rc::new(IoCounters::default());
         let wal = Rc::new(RefCell::new(WalFile::new(
             io.clone(),
             WalFileShared::new_shared(
@@ -2524,6 +2587,7 @@ mod ptrmap_tests {
             )
             .unwrap(),
             buffer_pool.clone(),
+            io_counters.clone(),
         )));
 
         let pager = Pager::new(
@@ -2534,6 +2598,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
+            io_counters,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();

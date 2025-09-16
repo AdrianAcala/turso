@@ -59,7 +59,7 @@ use crate::storage::btree::offset::{
 use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_threshold_min};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
-use crate::storage::pager::Pager;
+use crate::storage::pager::{IoCounters, Pager};
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{RawSlice, RefValue, SerialType, SerialTypeKind, TextRef, TextSubtype};
 use crate::{
@@ -902,27 +902,32 @@ pub fn begin_read_page(
     page_idx: usize,
     allow_empty_read: bool,
     io_ctx: &IOContext,
+    io_counters: Rc<IoCounters>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
     let buf = buffer_pool.get_page();
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
-    let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-        let Ok((mut buf, bytes_read)) = res else {
-            page.clear_locked();
-            return;
-        };
-        let buf_len = buf.len();
-        turso_assert!(
-            (allow_empty_read && bytes_read == 0) || bytes_read == buf_len as i32,
-            "read({bytes_read}) != expected({buf_len})"
-        );
-        let page = page.clone();
-        if bytes_read == 0 {
-            buf = Arc::new(Buffer::new_temporary(0));
-        }
-        finish_read_page(page_idx, buf, page.clone());
-    });
+    let complete = {
+        let io_counters = io_counters.clone();
+        Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+            let Ok((mut buf, bytes_read)) = res else {
+                page.clear_locked();
+                return;
+            };
+            let buf_len = buf.len();
+            turso_assert!(
+                (allow_empty_read && bytes_read == 0) || bytes_read == buf_len as i32,
+                "read({bytes_read}) != expected({buf_len})"
+            );
+            let page = page.clone();
+            if bytes_read == 0 {
+                buf = Arc::new(Buffer::new_temporary(0));
+            }
+            io_counters.increment_read(bytes_read.max(0) as u64);
+            finish_read_page(page_idx, buf, page.clone());
+        })
+    };
     let c = Completion::new_read(buf, complete);
     db_file.read_page(page_idx, io_ctx, c)
 }
@@ -961,6 +966,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
 
     let write_complete = {
         let buf_copy = buffer.clone();
+        let io_counters = pager.io_counters();
         Box::new(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
                 return;
@@ -974,6 +980,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
                 bytes_written == buf_len as i32,
                 "wrote({bytes_written}) != expected({buf_len})"
             );
+            io_counters.increment_write(bytes_written.max(0) as u64);
         })
     };
     let c = Completion::new_write(write_complete);
@@ -1054,11 +1061,13 @@ pub fn write_pages_vectored(
             let is_last_chunk = current_run == run_count && final_write;
 
             let total_sz = (page_sz * run_bufs.len()) as i32;
+            let io_counters = pager.io_counters();
             let cmp = move |res| {
                 let Ok(res) = res else {
                     return;
                 };
                 turso_assert!(total_sz == res, "failed to write expected size");
+                io_counters.increment_write(res.max(0) as u64);
                 if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
                     done_cl.store(true, Ordering::Release);
                 }
@@ -1961,10 +1970,19 @@ pub fn begin_read_wal_frame_raw(
     io: &Arc<dyn File>,
     offset: u64,
     complete: Box<ReadComplete>,
+    io_counters: Rc<IoCounters>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_wal_frame_raw(offset={})", offset);
     let buf = Arc::new(buffer_pool.get_wal_frame());
-    let c = Completion::new_read(buf, complete);
+    let c = Completion::new_read(buf, {
+        let io_counters = io_counters.clone();
+        move |res| {
+            if let Ok((_, bytes_read)) = &res {
+                io_counters.increment_read((*bytes_read).max(0) as u64);
+            }
+            complete(res)
+        }
+    });
     let c = io.pread(offset, c)?;
     Ok(c)
 }
@@ -1976,6 +1994,7 @@ pub fn begin_read_wal_frame(
     complete: Box<ReadComplete>,
     page_idx: usize,
     io_ctx: &IOContext,
+    io_counters: Rc<IoCounters>,
 ) -> Result<Completion> {
     tracing::trace!(
         "begin_read_wal_frame(offset={}, page_idx={})",
@@ -2005,6 +2024,7 @@ pub fn begin_read_wal_frame(
                             encrypted_buf
                                 .as_mut_slice()
                                 .copy_from_slice(&decrypted_data);
+                            io_counters.increment_read(bytes_read.max(0) as u64);
                             original_complete(Ok((encrypted_buf, bytes_read)));
                         }
                         Err(e) => {
@@ -2036,6 +2056,7 @@ pub fn begin_read_wal_frame(
 
                     match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                         Ok(_) => {
+                            io_counters.increment_read(bytes_read as u64);
                             original_c(Ok((buf, bytes_read)));
                         }
                         Err(e) => {
@@ -2050,7 +2071,16 @@ pub fn begin_read_wal_frame(
             io.pread(offset, c)
         }
         EncryptionOrChecksum::None => {
-            let c = Completion::new_read(buf, complete);
+            let instrumented = {
+                let io_counters = io_counters.clone();
+                move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
+                    if let Ok((_, bytes_read)) = &res {
+                        io_counters.increment_read((*bytes_read).max(0) as u64);
+                    }
+                    complete(res)
+                }
+            };
+            let c = Completion::new_read(buf, instrumented);
             io.pread(offset, c)
         }
     }

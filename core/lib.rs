@@ -82,7 +82,7 @@ use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
-use storage::pager::{AtomicDbState, DbState};
+use storage::pager::{AtomicDbState, DbState, IoCounterSnapshot, IoCounters};
 use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
@@ -100,6 +100,7 @@ pub use types::Value;
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS};
+pub use vdbe::metrics::StatementMetrics;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -601,10 +602,12 @@ impl Database {
             }
 
             let db_state = self.db_state.clone();
+            let io_counters = Rc::new(IoCounters::default());
             let wal = Rc::new(RefCell::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
                 buffer_pool.clone(),
+                io_counters.clone(),
             )));
             let pager = Pager::new(
                 self.db_file.clone(),
@@ -614,6 +617,7 @@ impl Database {
                 buffer_pool.clone(),
                 db_state,
                 self.init_lock.clone(),
+                io_counters,
             )?;
             pager.page_size.set(Some(page_size));
             if let Some(reserved_bytes) = reserved_bytes {
@@ -635,6 +639,7 @@ impl Database {
 
         // No existing WAL; create one.
         let db_state = self.db_state.clone();
+        let io_counters = Rc::new(IoCounters::default());
         let mut pager = Pager::new(
             self.db_file.clone(),
             None,
@@ -643,6 +648,7 @@ impl Database {
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),
+            io_counters.clone(),
         )?;
 
         pager.page_size.set(Some(page_size));
@@ -666,6 +672,7 @@ impl Database {
             self.io.clone(),
             self.shared_wal.clone(),
             buffer_pool,
+            io_counters,
         )));
         pager.set_wal(wal);
 
@@ -2184,6 +2191,8 @@ pub struct Statement {
     state: vdbe::ProgramState,
     mv_store: Option<Arc<MvStore>>,
     pager: Rc<Pager>,
+    io_counters: Rc<IoCounters>,
+    io_start: IoCounterSnapshot,
     /// Whether the statement accesses the database.
     /// Used to determine whether we need to check for schema changes when
     /// starting a transaction.
@@ -2210,16 +2219,36 @@ impl Statement {
             QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
         };
         let state = vdbe::ProgramState::new(max_registers, cursor_count);
+        let io_counters = pager.io_counters();
+        let io_start = io_counters.snapshot();
         Self {
             program,
             state,
             mv_store,
             pager,
+            io_counters,
+            io_start,
             accesses_db,
             query_mode,
             busy: false,
             busy_timeout: None,
         }
+    }
+
+    fn capture_io_metrics(&mut self) {
+        let snapshot = self.io_counters.snapshot();
+        let read_delta = snapshot.bytes_read.saturating_sub(self.io_start.bytes_read);
+        let write_delta = snapshot
+            .bytes_written
+            .saturating_sub(self.io_start.bytes_written);
+        self.state.metrics.io_bytes_read =
+            self.state.metrics.io_bytes_read.saturating_add(read_delta);
+        self.state.metrics.io_bytes_written = self
+            .state
+            .metrics
+            .io_bytes_written
+            .saturating_add(write_delta);
+        self.io_start = snapshot;
     }
     pub fn get_query_mode(&self) -> QueryMode {
         self.query_mode
@@ -2284,6 +2313,7 @@ impl Statement {
 
         // Aggregate metrics when statement completes
         if matches!(res, Ok(StepResult::Done)) {
+            self.capture_io_metrics();
             let mut conn_metrics = self.program.connection.metrics.borrow_mut();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;

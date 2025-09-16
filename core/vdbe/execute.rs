@@ -7,7 +7,7 @@ use crate::storage::btree::{
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
+use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState, IoCounters};
 use crate::storage::sqlite3_ondisk::read_varint;
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -1912,6 +1912,12 @@ pub fn op_result_row(
     Ok(InsnFunctionStepResult::Row)
 }
 
+fn note_index_usage(program: &Program, state: &mut ProgramState, cursor_id: usize) {
+    if let Some((_, CursorType::BTreeIndex(index))) = program.cursor_ref.get(cursor_id) {
+        state.metrics.indexes_used.insert(index.name.clone());
+    }
+}
+
 pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
@@ -1950,6 +1956,7 @@ pub fn op_next(
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
+                note_index_usage(program, state, *cursor_id);
             } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
@@ -1992,6 +1999,7 @@ pub fn op_prev(
         if let Some((_, cursor_type)) = program.cursor_ref.get(*cursor_id) {
             if cursor_type.is_index() {
                 state.metrics.index_steps = state.metrics.index_steps.saturating_add(1);
+                note_index_usage(program, state, *cursor_id);
             } else if matches!(cursor_type, CursorType::BTreeTable(_)) {
                 state.metrics.fullscan_steps = state.metrics.fullscan_steps.saturating_add(1);
             }
@@ -2709,6 +2717,7 @@ pub fn op_seek_rowid(
     // Increment btree_seeks metric for SeekRowid operation after cursor is dropped
     if did_seek {
         state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
+        note_index_usage(program, state, *cursor_id);
     }
     state.pc = pc;
     Ok(InsnFunctionStepResult::Step)
@@ -3000,6 +3009,7 @@ pub fn seek_internal(
                     continue;
                 }
                 OpSeekState::Seek { key, op } => {
+                    let op_copy = *op;
                     let seek_result = {
                         let cursor = get_cursor!(state, cursor_id);
                         let cursor = cursor.as_btree_mut();
@@ -3011,18 +3021,21 @@ pub fn seek_internal(
                             _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
                         }
                     };
-                        match cursor.seek(seek_key, *op)? {
+                        match cursor.seek(seek_key, op_copy)? {
                             IOResult::Done(seek_result) => seek_result,
                             IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };
                     // Increment btree_seeks metric after seek operation and cursor is dropped
                     state.metrics.btree_seeks = state.metrics.btree_seeks.saturating_add(1);
+                    if is_index {
+                        note_index_usage(program, state, cursor_id);
+                    }
                     let found = match seek_result {
                         SeekResult::Found => true,
                         SeekResult::NotFound => false,
                         SeekResult::TryAdvance => {
-                            state.seek_state = OpSeekState::Advance { op: *op };
+                            state.seek_state = OpSeekState::Advance { op: op_copy };
                             continue;
                         }
                     };
@@ -7094,6 +7107,7 @@ pub fn op_open_ephemeral(
             let buffer_pool = program.connection._db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
+            let io_counters = Rc::new(IoCounters::default());
             let pager = Rc::new(Pager::new(
                 db_file,
                 None,
@@ -7102,6 +7116,7 @@ pub fn op_open_ephemeral(
                 buffer_pool.clone(),
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
+                io_counters,
             )?);
 
             let page_size = pager
